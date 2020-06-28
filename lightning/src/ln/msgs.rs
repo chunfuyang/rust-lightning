@@ -15,23 +15,24 @@
 //! raw socket events into your non-internet-facing system and then send routing events back to
 //! track the network on the less-secure system.
 
-use secp256k1::key::PublicKey;
-use secp256k1::Signature;
-use secp256k1;
-use bitcoin_hashes::sha256d::Hash as Sha256dHash;
+use bitcoin::secp256k1::key::PublicKey;
+use bitcoin::secp256k1::Signature;
+use bitcoin::secp256k1;
 use bitcoin::blockdata::script::Script;
+use bitcoin::hash_types::{Txid, BlockHash};
 
 use ln::features::{ChannelFeatures, InitFeatures, NodeFeatures};
 
-use std::error::Error;
 use std::{cmp, fmt};
 use std::io::Read;
-use std::result::Result;
 
 use util::events;
 use util::ser::{Readable, Writeable, Writer, FixedLengthReader, HighZeroBytesDroppedVarInt};
 
-use ln::channelmanager::{PaymentPreimage, PaymentHash};
+use ln::channelmanager::{PaymentPreimage, PaymentHash, PaymentSecret};
+
+/// 21 million * 10^8 * 1000
+pub(crate) const MAX_VALUE_MSAT: u64 = 21_000_000_0000_0000_000;
 
 /// An error in decoding a message or struct.
 #[derive(Debug)]
@@ -47,8 +48,6 @@ pub enum DecodeError {
 	InvalidValue,
 	/// Buffer too short
 	ShortRead,
-	/// node_announcement included more than one address of a given type!
-	ExtraAddressesPerType,
 	/// A length descriptor in the packet didn't describe the later data correctly
 	BadLengthDescriptor,
 	/// Error from std::io
@@ -84,7 +83,7 @@ pub struct Pong {
 /// An open_channel message to be sent or received from a peer
 #[derive(Clone)]
 pub struct OpenChannel {
-	pub(crate) chain_hash: Sha256dHash,
+	pub(crate) chain_hash: BlockHash,
 	pub(crate) temporary_channel_id: [u8; 32],
 	pub(crate) funding_satoshis: u64,
 	pub(crate) push_msat: u64,
@@ -97,7 +96,7 @@ pub struct OpenChannel {
 	pub(crate) max_accepted_htlcs: u16,
 	pub(crate) funding_pubkey: PublicKey,
 	pub(crate) revocation_basepoint: PublicKey,
-	pub(crate) payment_basepoint: PublicKey,
+	pub(crate) payment_point: PublicKey,
 	pub(crate) delayed_payment_basepoint: PublicKey,
 	pub(crate) htlc_basepoint: PublicKey,
 	pub(crate) first_per_commitment_point: PublicKey,
@@ -118,7 +117,7 @@ pub struct AcceptChannel {
 	pub(crate) max_accepted_htlcs: u16,
 	pub(crate) funding_pubkey: PublicKey,
 	pub(crate) revocation_basepoint: PublicKey,
-	pub(crate) payment_basepoint: PublicKey,
+	pub(crate) payment_point: PublicKey,
 	pub(crate) delayed_payment_basepoint: PublicKey,
 	pub(crate) htlc_basepoint: PublicKey,
 	pub(crate) first_per_commitment_point: PublicKey,
@@ -129,7 +128,7 @@ pub struct AcceptChannel {
 #[derive(Clone)]
 pub struct FundingCreated {
 	pub(crate) temporary_channel_id: [u8; 32],
-	pub(crate) funding_txid: Sha256dHash,
+	pub(crate) funding_txid: Txid,
 	pub(crate) funding_output_index: u16,
 	pub(crate) signature: Signature,
 }
@@ -304,6 +303,9 @@ impl NetAddress {
 			&NetAddress::OnionV3 { .. } => { 37 },
 		}
 	}
+
+	/// The maximum length of any address descriptor, not including the 1-byte type
+	pub(crate) const MAX_LEN: u16 = 37;
 }
 
 impl Writeable for NetAddress {
@@ -336,9 +338,9 @@ impl Writeable for NetAddress {
 	}
 }
 
-impl<R: ::std::io::Read>  Readable<R> for Result<NetAddress, u8> {
-	fn read(reader: &mut R) -> Result<Result<NetAddress, u8>, DecodeError> {
-		let byte = <u8 as Readable<R>>::read(reader)?;
+impl Readable for Result<NetAddress, u8> {
+	fn read<R: Read>(reader: &mut R) -> Result<Result<NetAddress, u8>, DecodeError> {
+		let byte = <u8 as Readable>::read(reader)?;
 		match byte {
 			1 => {
 				Ok(Ok(NetAddress::IPv4 {
@@ -388,7 +390,7 @@ pub struct UnsignedNodeAnnouncement {
 	pub(crate) excess_address_data: Vec<u8>,
 	pub(crate) excess_data: Vec<u8>,
 }
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq, Clone, Debug)]
 /// A node_announcement message to be sent or received from a peer
 pub struct NodeAnnouncement {
 	pub(crate) signature: Signature,
@@ -400,7 +402,7 @@ pub struct NodeAnnouncement {
 #[derive(PartialEq, Clone, Debug)]
 pub struct UnsignedChannelAnnouncement {
 	pub(crate) features: ChannelFeatures,
-	pub(crate) chain_hash: Sha256dHash,
+	pub(crate) chain_hash: BlockHash,
 	pub(crate) short_channel_id: u64,
 	/// One of the two node_ids which are endpoints of this channel
 	pub        node_id_1: PublicKey,
@@ -422,7 +424,7 @@ pub struct ChannelAnnouncement {
 
 #[derive(PartialEq, Clone, Debug)]
 pub(crate) struct UnsignedChannelUpdate {
-	pub(crate) chain_hash: Sha256dHash,
+	pub(crate) chain_hash: BlockHash,
 	pub(crate) short_channel_id: u64,
 	pub(crate) timestamp: u32,
 	pub(crate) flags: u16,
@@ -599,10 +601,11 @@ pub trait RoutingMessageHandler : Send + Sync {
 	fn handle_htlc_fail_channel_update(&self, update: &HTLCFailChannelUpdate);
 	/// Gets a subset of the channel announcements and updates required to dump our routing table
 	/// to a remote node, starting at the short_channel_id indicated by starting_point and
-	/// including batch_amount entries.
-	fn get_next_channel_announcements(&self, starting_point: u64, batch_amount: u8) -> Vec<(ChannelAnnouncement, ChannelUpdate, ChannelUpdate)>;
+	/// including the batch_amount entries immediately higher in numerical value than starting_point.
+	fn get_next_channel_announcements(&self, starting_point: u64, batch_amount: u8) -> Vec<(ChannelAnnouncement, Option<ChannelUpdate>, Option<ChannelUpdate>)>;
 	/// Gets a subset of the node announcements required to dump our routing table to a remote node,
-	/// starting at the node *after* the provided publickey and including batch_amount entries.
+	/// starting at the node *after* the provided publickey and including batch_amount entries
+	/// immediately higher (as defined by <PublicKey as Ord>::cmp) than starting_point.
 	/// If None is provided for starting_point, we start at the first node.
 	fn get_next_node_announcements(&self, starting_point: Option<&PublicKey>, batch_amount: u8) -> Vec<NodeAnnouncement>;
 	/// Returns whether a full sync should be requested from a peer.
@@ -610,8 +613,17 @@ pub trait RoutingMessageHandler : Send + Sync {
 }
 
 mod fuzzy_internal_msgs {
+	use ln::channelmanager::PaymentSecret;
+
 	// These types aren't intended to be pub, but are exposed for direct fuzzing (as we deserialize
 	// them from untrusted input):
+	#[derive(Clone)]
+	pub(crate) struct FinalOnionHopData {
+		pub(crate) payment_secret: PaymentSecret,
+		/// The total value, in msat, of the payment as received by the ultimate recipient.
+		/// Message serialization may panic if this value is more than 21 million Bitcoin.
+		pub(crate) total_msat: u64,
+	}
 
 	pub(crate) enum OnionHopDataFormat {
 		Legacy { // aka Realm-0
@@ -620,11 +632,15 @@ mod fuzzy_internal_msgs {
 		NonFinalNode {
 			short_channel_id: u64,
 		},
-		FinalNode,
+		FinalNode {
+			payment_data: Option<FinalOnionHopData>,
+		},
 	}
 
 	pub struct OnionHopData {
 		pub(crate) format: OnionHopDataFormat,
+		/// The value, in msat, of the payment after this hop's fee is deducted.
+		/// Message serialization may panic if this value is more than 21 million Bitcoin.
 		pub(crate) amt_to_forward: u64,
 		pub(crate) outgoing_cltv_value: u32,
 		// 12 bytes of 0-padding for Legacy format
@@ -670,22 +686,16 @@ pub(crate) struct OnionErrorPacket {
 	pub(crate) data: Vec<u8>,
 }
 
-impl Error for DecodeError {
-	fn description(&self) -> &str {
-		match *self {
-			DecodeError::UnknownVersion => "Unknown realm byte in Onion packet",
-			DecodeError::UnknownRequiredFeature => "Unknown required feature preventing decode",
-			DecodeError::InvalidValue => "Nonsense bytes didn't map to the type they were interpreted as",
-			DecodeError::ShortRead => "Packet extended beyond the provided bytes",
-			DecodeError::ExtraAddressesPerType => "More than one address of a single type",
-			DecodeError::BadLengthDescriptor => "A length descriptor in the packet didn't describe the later data correctly",
-			DecodeError::Io(ref e) => e.description(),
-		}
-	}
-}
 impl fmt::Display for DecodeError {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		f.write_str(self.description())
+		match *self {
+			DecodeError::UnknownVersion => f.write_str("Unknown realm byte in Onion packet"),
+			DecodeError::UnknownRequiredFeature => f.write_str("Unknown required feature preventing decode"),
+			DecodeError::InvalidValue => f.write_str("Nonsense bytes didn't map to the type they were interpreted as"),
+			DecodeError::ShortRead => f.write_str("Packet extended beyond the provided bytes"),
+			DecodeError::BadLengthDescriptor => f.write_str("A length descriptor in the packet didn't describe the later data correctly"),
+			DecodeError::Io(ref e) => e.fmt(f),
+		}
 	}
 }
 
@@ -718,9 +728,9 @@ impl Writeable for OptionalField<Script> {
 	}
 }
 
-impl<R: Read> Readable<R> for OptionalField<Script> {
-	fn read(r: &mut R) -> Result<Self, DecodeError> {
-		match <u16 as Readable<R>>::read(r) {
+impl Readable for OptionalField<Script> {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		match <u16 as Readable>::read(r) {
 			Ok(len) => {
 				let mut buf = vec![0; len as usize];
 				r.read_exact(&mut buf)?;
@@ -746,7 +756,7 @@ impl_writeable_len_match!(AcceptChannel, {
 	max_accepted_htlcs,
 	funding_pubkey,
 	revocation_basepoint,
-	payment_basepoint,
+	payment_point,
 	delayed_payment_basepoint,
 	htlc_basepoint,
 	first_per_commitment_point,
@@ -777,14 +787,14 @@ impl Writeable for ChannelReestablish {
 	}
 }
 
-impl<R: Read> Readable<R> for ChannelReestablish{
-	fn read(r: &mut R) -> Result<Self, DecodeError> {
+impl Readable for ChannelReestablish{
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		Ok(Self {
 			channel_id: Readable::read(r)?,
 			next_local_commitment_number: Readable::read(r)?,
 			next_remote_commitment_number: Readable::read(r)?,
 			data_loss_protect: {
-				match <[u8; 32] as Readable<R>>::read(r) {
+				match <[u8; 32] as Readable>::read(r) {
 					Ok(your_last_per_commitment_secret) =>
 						OptionalField::Present(DataLossProtect {
 							your_last_per_commitment_secret,
@@ -846,8 +856,8 @@ impl Writeable for Init {
 	}
 }
 
-impl<R: Read> Readable<R> for Init {
-	fn read(r: &mut R) -> Result<Self, DecodeError> {
+impl Readable for Init {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		let global_features: InitFeatures = Readable::read(r)?;
 		let features: InitFeatures = Readable::read(r)?;
 		Ok(Init {
@@ -873,7 +883,7 @@ impl_writeable_len_match!(OpenChannel, {
 	max_accepted_htlcs,
 	funding_pubkey,
 	revocation_basepoint,
-	payment_basepoint,
+	payment_point,
 	delayed_payment_basepoint,
 	htlc_basepoint,
 	first_per_commitment_point,
@@ -940,8 +950,8 @@ impl Writeable for OnionPacket {
 	}
 }
 
-impl<R: Read> Readable<R> for OnionPacket {
-	fn read(r: &mut R) -> Result<Self, DecodeError> {
+impl Readable for OnionPacket {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		Ok(OnionPacket {
 			version: Readable::read(r)?,
 			public_key: {
@@ -964,9 +974,29 @@ impl_writeable!(UpdateAddHTLC, 32+8+8+32+4+1366, {
 	onion_routing_packet
 });
 
+impl Writeable for FinalOnionHopData {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), ::std::io::Error> {
+		w.size_hint(32 + 8 - (self.total_msat.leading_zeros()/8) as usize);
+		self.payment_secret.0.write(w)?;
+		HighZeroBytesDroppedVarInt(self.total_msat).write(w)
+	}
+}
+
+impl Readable for FinalOnionHopData {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let secret: [u8; 32] = Readable::read(r)?;
+		let amt: HighZeroBytesDroppedVarInt<u64> = Readable::read(r)?;
+		Ok(Self { payment_secret: PaymentSecret(secret), total_msat: amt.0 })
+	}
+}
+
 impl Writeable for OnionHopData {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), ::std::io::Error> {
 		w.size_hint(33);
+		// Note that this should never be reachable if Rust-Lightning generated the message, as we
+		// check values are sane long before we get here, though its possible in the future
+		// user-generated messages may hit this.
+		if self.amt_to_forward > MAX_VALUE_MSAT { panic!("We should never be sending infinite/overflow onion payments"); }
 		match self.format {
 			OnionHopDataFormat::Legacy { short_channel_id } => {
 				0u8.write(w)?;
@@ -982,7 +1012,15 @@ impl Writeable for OnionHopData {
 					(6, short_channel_id)
 				});
 			},
-			OnionHopDataFormat::FinalNode => {
+			OnionHopDataFormat::FinalNode { payment_data: Some(ref final_data) } => {
+				if final_data.total_msat > MAX_VALUE_MSAT { panic!("We should never be sending infinite/overflow onion payments"); }
+				encode_varint_length_prefixed_tlv!(w, {
+					(2, HighZeroBytesDroppedVarInt(self.amt_to_forward)),
+					(4, HighZeroBytesDroppedVarInt(self.outgoing_cltv_value)),
+					(8, final_data)
+				});
+			},
+			OnionHopDataFormat::FinalNode { payment_data: None } => {
 				encode_varint_length_prefixed_tlv!(w, {
 					(2, HighZeroBytesDroppedVarInt(self.amt_to_forward)),
 					(4, HighZeroBytesDroppedVarInt(self.outgoing_cltv_value))
@@ -993,8 +1031,8 @@ impl Writeable for OnionHopData {
 	}
 }
 
-impl<R: Read> Readable<R> for OnionHopData {
-	fn read(mut r: &mut R) -> Result<Self, DecodeError> {
+impl Readable for OnionHopData {
+	fn read<R: Read>(mut r: &mut R) -> Result<Self, DecodeError> {
 		use bitcoin::consensus::encode::{Decodable, Error, VarInt};
 		let v: VarInt = Decodable::consensus_decode(&mut r)
 			.map_err(|e| match e {
@@ -1007,19 +1045,29 @@ impl<R: Read> Readable<R> for OnionHopData {
 			let mut amt = HighZeroBytesDroppedVarInt(0u64);
 			let mut cltv_value = HighZeroBytesDroppedVarInt(0u32);
 			let mut short_id: Option<u64> = None;
+			let mut payment_data: Option<FinalOnionHopData> = None;
 			decode_tlv!(&mut rd, {
 				(2, amt),
 				(4, cltv_value)
 			}, {
-				(6, short_id)
+				(6, short_id),
+				(8, payment_data)
 			});
 			rd.eat_remaining().map_err(|_| DecodeError::ShortRead)?;
 			let format = if let Some(short_channel_id) = short_id {
+				if payment_data.is_some() { return Err(DecodeError::InvalidValue); }
 				OnionHopDataFormat::NonFinalNode {
 					short_channel_id,
 				}
 			} else {
-				OnionHopDataFormat::FinalNode
+				if let &Some(ref data) = &payment_data {
+					if data.total_msat > MAX_VALUE_MSAT {
+						return Err(DecodeError::InvalidValue);
+					}
+				}
+				OnionHopDataFormat::FinalNode {
+					payment_data
+				}
 			};
 			(format, amt.0, cltv_value.0)
 		} else {
@@ -1032,6 +1080,9 @@ impl<R: Read> Readable<R> for OnionHopData {
 			(format, amt, cltv_value)
 		};
 
+		if amt > MAX_VALUE_MSAT {
+			return Err(DecodeError::InvalidValue);
+		}
 		Ok(OnionHopData {
 			format,
 			amt_to_forward: amt,
@@ -1049,8 +1100,8 @@ impl Writeable for Ping {
 	}
 }
 
-impl<R: Read> Readable<R> for Ping {
-	fn read(r: &mut R) -> Result<Self, DecodeError> {
+impl Readable for Ping {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		Ok(Ping {
 			ponglen: Readable::read(r)?,
 			byteslen: {
@@ -1070,8 +1121,8 @@ impl Writeable for Pong {
 	}
 }
 
-impl<R: Read> Readable<R> for Pong {
-	fn read(r: &mut R) -> Result<Self, DecodeError> {
+impl Readable for Pong {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		Ok(Pong {
 			byteslen: {
 				let byteslen = Readable::read(r)?;
@@ -1097,8 +1148,8 @@ impl Writeable for UnsignedChannelAnnouncement {
 	}
 }
 
-impl<R: Read> Readable<R> for UnsignedChannelAnnouncement {
-	fn read(r: &mut R) -> Result<Self, DecodeError> {
+impl Readable for UnsignedChannelAnnouncement {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		Ok(Self {
 			features: Readable::read(r)?,
 			chain_hash: Readable::read(r)?,
@@ -1143,8 +1194,8 @@ impl Writeable for UnsignedChannelUpdate {
 	}
 }
 
-impl<R: Read> Readable<R> for UnsignedChannelUpdate {
-	fn read(r: &mut R) -> Result<Self, DecodeError> {
+impl Readable for UnsignedChannelUpdate {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		Ok(Self {
 			chain_hash: Readable::read(r)?,
 			short_channel_id: Readable::read(r)?,
@@ -1181,12 +1232,12 @@ impl Writeable for ErrorMessage {
 	}
 }
 
-impl<R: Read> Readable<R> for ErrorMessage {
-	fn read(r: &mut R) -> Result<Self, DecodeError> {
+impl Readable for ErrorMessage {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		Ok(Self {
 			channel_id: Readable::read(r)?,
 			data: {
-				let mut sz: usize = <u16 as Readable<R>>::read(r)? as usize;
+				let mut sz: usize = <u16 as Readable>::read(r)? as usize;
 				let mut data = vec![];
 				let data_len = r.read_to_end(&mut data)?;
 				sz = cmp::min(data_len, sz);
@@ -1209,8 +1260,7 @@ impl Writeable for UnsignedNodeAnnouncement {
 		self.alias.write(w)?;
 
 		let mut addrs_to_encode = self.addresses.clone();
-		addrs_to_encode.sort_unstable_by(|a, b| { a.get_id().cmp(&b.get_id()) });
-		addrs_to_encode.dedup_by(|a, b| { a.get_id() == b.get_id() });
+		addrs_to_encode.sort_by(|a, b| { a.get_id().cmp(&b.get_id()) });
 		let mut addr_len = 0;
 		for addr in &addrs_to_encode {
 			addr_len += 1 + addr.len();
@@ -1225,8 +1275,8 @@ impl Writeable for UnsignedNodeAnnouncement {
 	}
 }
 
-impl<R: Read> Readable<R> for UnsignedNodeAnnouncement {
-	fn read(r: &mut R) -> Result<Self, DecodeError> {
+impl Readable for UnsignedNodeAnnouncement {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		let features: NodeFeatures = Readable::read(r)?;
 		let timestamp: u32 = Readable::read(r)?;
 		let node_id: PublicKey = Readable::read(r)?;
@@ -1235,7 +1285,8 @@ impl<R: Read> Readable<R> for UnsignedNodeAnnouncement {
 		let alias: [u8; 32] = Readable::read(r)?;
 
 		let addr_len: u16 = Readable::read(r)?;
-		let mut addresses: Vec<NetAddress> = Vec::with_capacity(4);
+		let mut addresses: Vec<NetAddress> = Vec::new();
+		let mut highest_addr_type = 0;
 		let mut addr_readpos = 0;
 		let mut excess = false;
 		let mut excess_byte = 0;
@@ -1243,28 +1294,11 @@ impl<R: Read> Readable<R> for UnsignedNodeAnnouncement {
 			if addr_len <= addr_readpos { break; }
 			match Readable::read(r) {
 				Ok(Ok(addr)) => {
-					match addr {
-						NetAddress::IPv4 { .. } => {
-							if addresses.len() > 0 {
-								return Err(DecodeError::ExtraAddressesPerType);
-							}
-						},
-						NetAddress::IPv6 { .. } => {
-							if addresses.len() > 1 || (addresses.len() == 1 && addresses[0].get_id() != 1) {
-								return Err(DecodeError::ExtraAddressesPerType);
-							}
-						},
-						NetAddress::OnionV2 { .. } => {
-							if addresses.len() > 2 || (addresses.len() > 0 && addresses.last().unwrap().get_id() > 2) {
-								return Err(DecodeError::ExtraAddressesPerType);
-							}
-						},
-						NetAddress::OnionV3 { .. } => {
-							if addresses.len() > 3 || (addresses.len() > 0 && addresses.last().unwrap().get_id() > 3) {
-								return Err(DecodeError::ExtraAddressesPerType);
-							}
-						},
+					if addr.get_id() < highest_addr_type {
+						// Addresses must be sorted in increasing order
+						return Err(DecodeError::InvalidValue);
 					}
+					highest_addr_type = addr.get_id();
 					if addr_len < addr_readpos + 1 + addr.len() {
 						return Err(DecodeError::BadLengthDescriptor);
 					}
@@ -1311,7 +1345,7 @@ impl<R: Read> Readable<R> for UnsignedNodeAnnouncement {
 
 impl_writeable_len_match!(NodeAnnouncement, {
 		{ NodeAnnouncement { contents: UnsignedNodeAnnouncement { ref features, ref addresses, ref excess_address_data, ref excess_data, ..}, .. },
-			64 + 76 + features.byte_count() + addresses.len()*38 + excess_address_data.len() + excess_data.len() }
+			64 + 76 + features.byte_count() + addresses.len()*(NetAddress::MAX_LEN as usize + 1) + excess_address_data.len() + excess_data.len() }
 	}, {
 	signature,
 	contents
@@ -1321,19 +1355,19 @@ impl_writeable_len_match!(NodeAnnouncement, {
 mod tests {
 	use hex;
 	use ln::msgs;
-	use ln::msgs::{ChannelFeatures, InitFeatures, NodeFeatures, OptionalField, OnionErrorPacket, OnionHopDataFormat};
-	use ln::channelmanager::{PaymentPreimage, PaymentHash};
+	use ln::msgs::{ChannelFeatures, FinalOnionHopData, InitFeatures, NodeFeatures, OptionalField, OnionErrorPacket, OnionHopDataFormat};
+	use ln::channelmanager::{PaymentPreimage, PaymentHash, PaymentSecret};
 	use util::ser::{Writeable, Readable};
 
-	use bitcoin_hashes::sha256d::Hash as Sha256dHash;
-	use bitcoin_hashes::hex::FromHex;
+	use bitcoin::hashes::hex::FromHex;
 	use bitcoin::util::address::Address;
 	use bitcoin::network::constants::Network;
 	use bitcoin::blockdata::script::Builder;
 	use bitcoin::blockdata::opcodes;
+	use bitcoin::hash_types::{Txid, BlockHash};
 
-	use secp256k1::key::{PublicKey,SecretKey};
-	use secp256k1::{Secp256k1, Message};
+	use bitcoin::secp256k1::key::{PublicKey,SecretKey};
+	use bitcoin::secp256k1::{Secp256k1, Message};
 
 	use std::io::Cursor;
 
@@ -1410,7 +1444,7 @@ mod tests {
 		assert_eq!(encoded_value, hex::decode("040000000000000005000000000000000600000000000000070000000000000000083a840000034dd977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073acf9953cef4700860f5967838eba2bae89288ad188ebf8b20bf995c3ea53a26df1876d0a3a0e13172ba286a673140190c02ba9da60a2e43a745188c8a83c7f3ef").unwrap());
 	}
 
-	fn do_encoding_channel_announcement(unknown_features_bits: bool, non_bitcoin_chain_hash: bool, excess_data: bool) {
+	fn do_encoding_channel_announcement(unknown_features_bits: bool, excess_data: bool) {
 		let secp_ctx = Secp256k1::new();
 		let (privkey_1, pubkey_1) = get_keys_from!("0101010101010101010101010101010101010101010101010101010101010101", secp_ctx);
 		let (privkey_2, pubkey_2) = get_keys_from!("0202020202020202020202020202020202020202020202020202020202020202", secp_ctx);
@@ -1420,13 +1454,13 @@ mod tests {
 		let sig_2 = get_sig_on!(privkey_2, secp_ctx, String::from("01010101010101010101010101010101"));
 		let sig_3 = get_sig_on!(privkey_3, secp_ctx, String::from("01010101010101010101010101010101"));
 		let sig_4 = get_sig_on!(privkey_4, secp_ctx, String::from("01010101010101010101010101010101"));
-		let mut features = ChannelFeatures::supported();
+		let mut features = ChannelFeatures::known();
 		if unknown_features_bits {
 			features = ChannelFeatures::from_le_bytes(vec![0xFF, 0xFF]);
 		}
 		let unsigned_channel_announcement = msgs::UnsignedChannelAnnouncement {
 			features,
-			chain_hash: if !non_bitcoin_chain_hash { Sha256dHash::from_hex("6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000").unwrap() } else { Sha256dHash::from_hex("000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943").unwrap() },
+			chain_hash: BlockHash::from_hex("6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000").unwrap(),
 			short_channel_id: 2316138423780173,
 			node_id_1: pubkey_1,
 			node_id_2: pubkey_2,
@@ -1448,11 +1482,7 @@ mod tests {
 		} else {
 			target_value.append(&mut hex::decode("0000").unwrap());
 		}
-		if non_bitcoin_chain_hash {
-			target_value.append(&mut hex::decode("43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000").unwrap());
-		} else {
-			target_value.append(&mut hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f").unwrap());
-		}
+		target_value.append(&mut hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f").unwrap());
 		target_value.append(&mut hex::decode("00083a840000034d031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076602531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33703462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b").unwrap());
 		if excess_data {
 			target_value.append(&mut hex::decode("0a00001400001e000028").unwrap());
@@ -1462,14 +1492,10 @@ mod tests {
 
 	#[test]
 	fn encoding_channel_announcement() {
-		do_encoding_channel_announcement(false, false, false);
-		do_encoding_channel_announcement(true, false, false);
-		do_encoding_channel_announcement(true, true, false);
-		do_encoding_channel_announcement(true, true, true);
-		do_encoding_channel_announcement(false, true, true);
-		do_encoding_channel_announcement(false, false, true);
-		do_encoding_channel_announcement(false, true, false);
-		do_encoding_channel_announcement(true, false, true);
+		do_encoding_channel_announcement(true, false);
+		do_encoding_channel_announcement(false, true);
+		do_encoding_channel_announcement(false, false);
+		do_encoding_channel_announcement(true, true);
 	}
 
 	fn do_encoding_node_announcement(unknown_features_bits: bool, ipv4: bool, ipv6: bool, onionv2: bool, onionv3: bool, excess_address_data: bool, excess_data: bool) {
@@ -1571,12 +1597,12 @@ mod tests {
 		do_encoding_node_announcement(false, false, true, false, true, false, false);
 	}
 
-	fn do_encoding_channel_update(non_bitcoin_chain_hash: bool, direction: bool, disable: bool, htlc_maximum_msat: bool) {
+	fn do_encoding_channel_update(direction: bool, disable: bool, htlc_maximum_msat: bool) {
 		let secp_ctx = Secp256k1::new();
 		let (privkey_1, _) = get_keys_from!("0101010101010101010101010101010101010101010101010101010101010101", secp_ctx);
 		let sig_1 = get_sig_on!(privkey_1, secp_ctx, String::from("01010101010101010101010101010101"));
 		let unsigned_channel_update = msgs::UnsignedChannelUpdate {
-			chain_hash: if !non_bitcoin_chain_hash { Sha256dHash::from_hex("6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000").unwrap() } else { Sha256dHash::from_hex("000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943").unwrap() },
+			chain_hash: BlockHash::from_hex("6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000").unwrap(),
 			short_channel_id: 2316138423780173,
 			timestamp: 20190119,
 			flags: if direction { 1 } else { 0 } | if disable { 1 << 1 } else { 0 } | if htlc_maximum_msat { 1 << 8 } else { 0 },
@@ -1592,11 +1618,7 @@ mod tests {
 		};
 		let encoded_value = channel_update.encode();
 		let mut target_value = hex::decode("d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a").unwrap();
-		if non_bitcoin_chain_hash {
-			target_value.append(&mut hex::decode("43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000").unwrap());
-		} else {
-			target_value.append(&mut hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f").unwrap());
-		}
+		target_value.append(&mut hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f").unwrap());
 		target_value.append(&mut hex::decode("00083a840000034d013413a7").unwrap());
 		if htlc_maximum_msat {
 			target_value.append(&mut hex::decode("01").unwrap());
@@ -1621,15 +1643,14 @@ mod tests {
 
 	#[test]
 	fn encoding_channel_update() {
-		do_encoding_channel_update(false, false, false, false);
-		do_encoding_channel_update(true, false, false, false);
-		do_encoding_channel_update(false, true, false, false);
-		do_encoding_channel_update(false, false, true, false);
-		do_encoding_channel_update(false, false, false, true);
-		do_encoding_channel_update(true, true, true, true);
+		do_encoding_channel_update(false, false, false);
+		do_encoding_channel_update(true, false, false);
+		do_encoding_channel_update(false, true, false);
+		do_encoding_channel_update(false, false, true);
+		do_encoding_channel_update(true, true, true);
 	}
 
-	fn do_encoding_open_channel(non_bitcoin_chain_hash: bool, random_bit: bool, shutdown: bool) {
+	fn do_encoding_open_channel(random_bit: bool, shutdown: bool) {
 		let secp_ctx = Secp256k1::new();
 		let (_, pubkey_1) = get_keys_from!("0101010101010101010101010101010101010101010101010101010101010101", secp_ctx);
 		let (_, pubkey_2) = get_keys_from!("0202020202020202020202020202020202020202020202020202020202020202", secp_ctx);
@@ -1638,7 +1659,7 @@ mod tests {
 		let (_, pubkey_5) = get_keys_from!("0505050505050505050505050505050505050505050505050505050505050505", secp_ctx);
 		let (_, pubkey_6) = get_keys_from!("0606060606060606060606060606060606060606060606060606060606060606", secp_ctx);
 		let open_channel = msgs::OpenChannel {
-			chain_hash: if !non_bitcoin_chain_hash { Sha256dHash::from_hex("6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000").unwrap() } else { Sha256dHash::from_hex("000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943").unwrap() },
+			chain_hash: BlockHash::from_hex("6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000").unwrap(),
 			temporary_channel_id: [2; 32],
 			funding_satoshis: 1311768467284833366,
 			push_msat: 2536655962884945560,
@@ -1651,7 +1672,7 @@ mod tests {
 			max_accepted_htlcs: 49340,
 			funding_pubkey: pubkey_1,
 			revocation_basepoint: pubkey_2,
-			payment_basepoint: pubkey_3,
+			payment_point: pubkey_3,
 			delayed_payment_basepoint: pubkey_4,
 			htlc_basepoint: pubkey_5,
 			first_per_commitment_point: pubkey_6,
@@ -1660,11 +1681,7 @@ mod tests {
 		};
 		let encoded_value = open_channel.encode();
 		let mut target_value = Vec::new();
-		if non_bitcoin_chain_hash {
-			target_value.append(&mut hex::decode("43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000").unwrap());
-		} else {
-			target_value.append(&mut hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f").unwrap());
-		}
+		target_value.append(&mut hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f").unwrap());
 		target_value.append(&mut hex::decode("02020202020202020202020202020202020202020202020202020202020202021234567890123456233403289122369832144668701144767633030896203198784335490624111800083a840000034d000c89d4c0bcc0bc031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076602531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33703462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b0362c0a046dacce86ddd0343c6d3c7c79c2208ba0d9c9cf24a6d046d21d21f90f703f006a18d5653c4edf5391ff23a61f03ff83d237e880ee61187fa9f379a028e0a").unwrap());
 		if random_bit {
 			target_value.append(&mut hex::decode("20").unwrap());
@@ -1679,11 +1696,10 @@ mod tests {
 
 	#[test]
 	fn encoding_open_channel() {
-		do_encoding_open_channel(false, false, false);
-		do_encoding_open_channel(true, false, false);
-		do_encoding_open_channel(false, true, false);
-		do_encoding_open_channel(false, false, true);
-		do_encoding_open_channel(true, true, true);
+		do_encoding_open_channel(false, false);
+		do_encoding_open_channel(true, false);
+		do_encoding_open_channel(false, true);
+		do_encoding_open_channel(true, true);
 	}
 
 	fn do_encoding_accept_channel(shutdown: bool) {
@@ -1705,7 +1721,7 @@ mod tests {
 			max_accepted_htlcs: 49340,
 			funding_pubkey: pubkey_1,
 			revocation_basepoint: pubkey_2,
-			payment_basepoint: pubkey_3,
+			payment_point: pubkey_3,
 			delayed_payment_basepoint: pubkey_4,
 			htlc_basepoint: pubkey_5,
 			first_per_commitment_point: pubkey_6,
@@ -1732,7 +1748,7 @@ mod tests {
 		let sig_1 = get_sig_on!(privkey_1, secp_ctx, String::from("01010101010101010101010101010101"));
 		let funding_created = msgs::FundingCreated {
 			temporary_channel_id: [2; 32],
-			funding_txid: Sha256dHash::from_hex("c2d4449afa8d26140898dd54d3390b057ba2a5afcf03ba29d7dc0d8b9ffe966e").unwrap(),
+			funding_txid: Txid::from_hex("c2d4449afa8d26140898dd54d3390b057ba2a5afcf03ba29d7dc0d8b9ffe966e").unwrap(),
 			funding_output_index: 255,
 			signature: sig_1,
 		};
@@ -2014,7 +2030,9 @@ mod tests {
 	#[test]
 	fn encoding_final_onion_hop_data() {
 		let mut msg = msgs::OnionHopData {
-			format: OnionHopDataFormat::FinalNode,
+			format: OnionHopDataFormat::FinalNode {
+				payment_data: None,
+			},
 			amt_to_forward: 0x0badf00d01020304,
 			outgoing_cltv_value: 0xffffffff,
 		};
@@ -2022,7 +2040,36 @@ mod tests {
 		let target_value = hex::decode("1002080badf00d010203040404ffffffff").unwrap();
 		assert_eq!(encoded_value, target_value);
 		msg = Readable::read(&mut Cursor::new(&target_value[..])).unwrap();
-		if let OnionHopDataFormat::FinalNode = msg.format { } else { panic!(); }
+		if let OnionHopDataFormat::FinalNode { payment_data: None } = msg.format { } else { panic!(); }
+		assert_eq!(msg.amt_to_forward, 0x0badf00d01020304);
+		assert_eq!(msg.outgoing_cltv_value, 0xffffffff);
+	}
+
+	#[test]
+	fn encoding_final_onion_hop_data_with_secret() {
+		let expected_payment_secret = PaymentSecret([0x42u8; 32]);
+		let mut msg = msgs::OnionHopData {
+			format: OnionHopDataFormat::FinalNode {
+				payment_data: Some(FinalOnionHopData {
+					payment_secret: expected_payment_secret,
+					total_msat: 0x1badca1f
+				}),
+			},
+			amt_to_forward: 0x0badf00d01020304,
+			outgoing_cltv_value: 0xffffffff,
+		};
+		let encoded_value = msg.encode();
+		let target_value = hex::decode("3602080badf00d010203040404ffffffff082442424242424242424242424242424242424242424242424242424242424242421badca1f").unwrap();
+		assert_eq!(encoded_value, target_value);
+		msg = Readable::read(&mut Cursor::new(&target_value[..])).unwrap();
+		if let OnionHopDataFormat::FinalNode {
+			payment_data: Some(FinalOnionHopData {
+				payment_secret,
+				total_msat: 0x1badca1f
+			})
+		} = msg.format {
+			assert_eq!(payment_secret, expected_payment_secret);
+		} else { panic!(); }
 		assert_eq!(msg.amt_to_forward, 0x0badf00d01020304);
 		assert_eq!(msg.outgoing_cltv_value, 0xffffffff);
 	}

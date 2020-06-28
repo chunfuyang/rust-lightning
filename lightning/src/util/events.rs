@@ -6,14 +6,14 @@
 //! few other things.
 
 use ln::msgs;
-use ln::channelmanager::{PaymentPreimage, PaymentHash};
+use ln::channelmanager::{PaymentPreimage, PaymentHash, PaymentSecret};
 use chain::transaction::OutPoint;
 use chain::keysinterface::SpendableOutputDescriptor;
 use util::ser::{Writeable, Writer, MaybeReadable, Readable};
 
 use bitcoin::blockdata::script::Script;
 
-use secp256k1::key::PublicKey;
+use bitcoin::secp256k1::key::PublicKey;
 
 use std::time::Duration;
 
@@ -51,13 +51,27 @@ pub enum Event {
 	},
 	/// Indicates we've received money! Just gotta dig out that payment preimage and feed it to
 	/// ChannelManager::claim_funds to get it....
-	/// Note that if the preimage is not known or the amount paid is incorrect, you must call
-	/// ChannelManager::fail_htlc_backwards to free up resources for this HTLC.
+	/// Note that if the preimage is not known or the amount paid is incorrect, you should call
+	/// ChannelManager::fail_htlc_backwards to free up resources for this HTLC and avoid
+	/// network congestion.
 	/// The amount paid should be considered 'incorrect' when it is less than or more than twice
 	/// the amount expected.
+	/// If you fail to call either ChannelManager::claim_funds or
+	/// ChannelManager::fail_htlc_backwards within the HTLC's timeout, the HTLC will be
+	/// automatically failed.
 	PaymentReceived {
 		/// The hash for which the preimage should be handed to the ChannelManager.
 		payment_hash: PaymentHash,
+		/// The "payment secret". This authenticates the sender to the recipient, preventing a
+		/// number of deanonymization attacks during the routing process.
+		/// As nodes upgrade, the invoices you provide should likely migrate to setting the
+		/// payment_secret feature to required, at which point you should fail_backwards any HTLCs
+		/// which have a None here.
+		/// Until then, however, values of None should be ignored, and only incorrect Some values
+		/// should result in an HTLC fail_backwards.
+		/// Note that, in any case, this value must be passed as-is to any fail or claim calls as
+		/// the HTLC index includes this value.
+		payment_secret: Option<PaymentSecret>,
 		/// The value, in thousandths of a satoshi, that this payment is for. Note that you must
 		/// compare this to the expected value before accepting the payment (as otherwise you are
 		/// providing proof-of-payment for less than the value you expected!).
@@ -86,6 +100,8 @@ pub enum Event {
 		rejected_by_dest: bool,
 #[cfg(test)]
 		error_code: Option<u16>,
+#[cfg(test)]
+		error_data: Option<Vec<u8>>,
 	},
 	/// Used to indicate that ChannelManager::process_pending_htlc_forwards should be called at a
 	/// time in the future.
@@ -119,9 +135,10 @@ impl Writeable for Event {
 				funding_txo.write(writer)?;
 				user_channel_id.write(writer)?;
 			},
-			&Event::PaymentReceived { ref payment_hash, ref amt } => {
+			&Event::PaymentReceived { ref payment_hash, ref payment_secret, ref amt } => {
 				2u8.write(writer)?;
 				payment_hash.write(writer)?;
+				payment_secret.write(writer)?;
 				amt.write(writer)?;
 			},
 			&Event::PaymentSent { ref payment_preimage } => {
@@ -131,12 +148,16 @@ impl Writeable for Event {
 			&Event::PaymentFailed { ref payment_hash, ref rejected_by_dest,
 				#[cfg(test)]
 				ref error_code,
+				#[cfg(test)]
+				ref error_data,
 			} => {
 				4u8.write(writer)?;
 				payment_hash.write(writer)?;
 				rejected_by_dest.write(writer)?;
 				#[cfg(test)]
 				error_code.write(writer)?;
+				#[cfg(test)]
+				error_data.write(writer)?;
 			},
 			&Event::PendingHTLCsForwardable { time_forwardable: _ } => {
 				5u8.write(writer)?;
@@ -154,8 +175,8 @@ impl Writeable for Event {
 		Ok(())
 	}
 }
-impl<R: ::std::io::Read> MaybeReadable<R> for Event {
-	fn read(reader: &mut R) -> Result<Option<Self>, msgs::DecodeError> {
+impl MaybeReadable for Event {
+	fn read<R: ::std::io::Read>(reader: &mut R) -> Result<Option<Self>, msgs::DecodeError> {
 		match Readable::read(reader)? {
 			0u8 => Ok(None),
 			1u8 => Ok(Some(Event::FundingBroadcastSafe {
@@ -164,6 +185,7 @@ impl<R: ::std::io::Read> MaybeReadable<R> for Event {
 				})),
 			2u8 => Ok(Some(Event::PaymentReceived {
 					payment_hash: Readable::read(reader)?,
+					payment_secret: Readable::read(reader)?,
 					amt: Readable::read(reader)?,
 				})),
 			3u8 => Ok(Some(Event::PaymentSent {
@@ -174,6 +196,8 @@ impl<R: ::std::io::Read> MaybeReadable<R> for Event {
 					rejected_by_dest: Readable::read(reader)?,
 					#[cfg(test)]
 					error_code: Readable::read(reader)?,
+					#[cfg(test)]
+					error_data: Readable::read(reader)?,
 				})),
 			5u8 => Ok(Some(Event::PendingHTLCsForwardable {
 					time_forwardable: Duration::from_secs(0)
@@ -278,11 +302,22 @@ pub enum MessageSendEvent {
 	},
 	/// Used to indicate that a channel_announcement and channel_update should be broadcast to all
 	/// peers (except the peer with node_id either msg.contents.node_id_1 or msg.contents.node_id_2).
+	///
+	/// Note that after doing so, you very likely (unless you did so very recently) want to call
+	/// ChannelManager::broadcast_node_announcement to trigger a BroadcastNodeAnnouncement event.
+	/// This ensures that any nodes which see our channel_announcement also have a relevant
+	/// node_announcement, including relevant feature flags which may be important for routing
+	/// through or to us.
 	BroadcastChannelAnnouncement {
 		/// The channel_announcement which should be sent.
 		msg: msgs::ChannelAnnouncement,
 		/// The followup channel_update which should be sent.
 		update_msg: msgs::ChannelUpdate,
+	},
+	/// Used to indicate that a node_announcement should be broadcast to all peers.
+	BroadcastNodeAnnouncement {
+		/// The node_announcement which should be sent.
+		msg: msgs::NodeAnnouncement,
 	},
 	/// Used to indicate that a channel_update should be broadcast to all peers.
 	BroadcastChannelUpdate {
@@ -297,9 +332,9 @@ pub enum MessageSendEvent {
 		action: msgs::ErrorAction
 	},
 	/// When a payment fails we may receive updates back from the hop where it failed. In such
-	/// cases this event is generated so that we can inform the router of this information.
+	/// cases this event is generated so that we can inform the network graph of this information.
 	PaymentFailureNetworkUpdate {
-		/// The channel/node update which should be sent to router
+		/// The channel/node update which should be sent to NetGraphMsgHandler
 		update: msgs::HTLCFailChannelUpdate,
 	}
 }

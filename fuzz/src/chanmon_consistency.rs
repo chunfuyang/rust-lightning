@@ -16,19 +16,17 @@ use bitcoin::blockdata::script::{Builder, Script};
 use bitcoin::blockdata::opcodes;
 use bitcoin::network::constants::Network;
 
-use bitcoin_hashes::Hash as TraitImport;
-use bitcoin_hashes::hash160::Hash as Hash160;
-use bitcoin_hashes::sha256::Hash as Sha256;
-use bitcoin_hashes::sha256d::Hash as Sha256d;
+use bitcoin::hashes::Hash as TraitImport;
+use bitcoin::hashes::sha256::Hash as Sha256;
+use bitcoin::hash_types::{BlockHash, WPubkeyHash};
 
 use lightning::chain::chaininterface;
 use lightning::chain::transaction::OutPoint;
-use lightning::chain::chaininterface::{BroadcasterInterface,ConfirmationTarget,ChainListener,FeeEstimator,ChainWatchInterfaceUtil};
+use lightning::chain::chaininterface::{BroadcasterInterface,ConfirmationTarget,ChainListener,FeeEstimator,ChainWatchInterfaceUtil,ChainWatchInterface};
 use lightning::chain::keysinterface::{KeysInterface, InMemoryChannelKeys};
 use lightning::ln::channelmonitor;
 use lightning::ln::channelmonitor::{ChannelMonitor, ChannelMonitorUpdateErr, HTLCUpdate};
-use lightning::ln::channelmanager::{ChannelManager, PaymentHash, PaymentPreimage, ChannelManagerReadArgs};
-use lightning::ln::router::{Route, RouteHop};
+use lightning::ln::channelmanager::{ChannelManager, PaymentHash, PaymentPreimage, PaymentSecret, ChannelManagerReadArgs};
 use lightning::ln::features::{ChannelFeatures, InitFeatures, NodeFeatures};
 use lightning::ln::msgs::{CommitmentUpdate, ChannelMessageHandler, ErrorAction, UpdateAddHTLC, Init};
 use lightning::util::enforcing_trait_impls::EnforcingChannelKeys;
@@ -37,11 +35,13 @@ use lightning::util::logger::Logger;
 use lightning::util::config::UserConfig;
 use lightning::util::events::{EventsProvider, MessageSendEventsProvider};
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
+use lightning::routing::router::{Route, RouteHop};
+
 
 use utils::test_logger;
 
-use secp256k1::key::{PublicKey,SecretKey};
-use secp256k1::Secp256k1;
+use bitcoin::secp256k1::key::{PublicKey,SecretKey};
+use bitcoin::secp256k1::Secp256k1;
 
 use std::mem;
 use std::cmp::Ordering;
@@ -52,7 +52,7 @@ use std::io::Cursor;
 
 struct FuzzEstimator {}
 impl FeeEstimator for FuzzEstimator {
-	fn get_est_sat_per_1000_weight(&self, _: ConfirmationTarget) -> u64 {
+	fn get_est_sat_per_1000_weight(&self, _: ConfirmationTarget) -> u32 {
 		253
 	}
 }
@@ -73,9 +73,9 @@ impl Writer for VecWriter {
 	}
 }
 
-pub struct TestChannelMonitor {
+struct TestChannelMonitor {
 	pub logger: Arc<dyn Logger>,
-	pub simple_monitor: Arc<channelmonitor::SimpleManyChannelMonitor<OutPoint, EnforcingChannelKeys, Arc<BroadcasterInterface>, Arc<FeeEstimator>>>,
+	pub simple_monitor: Arc<channelmonitor::SimpleManyChannelMonitor<OutPoint, EnforcingChannelKeys, Arc<TestBroadcaster>, Arc<FuzzEstimator>, Arc<dyn Logger>, Arc<dyn ChainWatchInterface>>>,
 	pub update_ret: Mutex<Result<(), channelmonitor::ChannelMonitorUpdateErr>>,
 	// If we reload a node with an old copy of ChannelMonitors, the ChannelManager deserialization
 	// logic will automatically force-close our channels for us (as we don't have an up-to-date
@@ -86,7 +86,7 @@ pub struct TestChannelMonitor {
 	pub should_update_manager: atomic::AtomicBool,
 }
 impl TestChannelMonitor {
-	pub fn new(chain_monitor: Arc<dyn chaininterface::ChainWatchInterface>, broadcaster: Arc<dyn chaininterface::BroadcasterInterface>, logger: Arc<dyn Logger>, feeest: Arc<FeeEstimator>) -> Self {
+	pub fn new(chain_monitor: Arc<dyn chaininterface::ChainWatchInterface>, broadcaster: Arc<TestBroadcaster>, logger: Arc<dyn Logger>, feeest: Arc<FuzzEstimator>) -> Self {
 		Self {
 			simple_monitor: Arc::new(channelmonitor::SimpleManyChannelMonitor::new(chain_monitor, broadcaster, logger.clone(), feeest)),
 			logger,
@@ -96,7 +96,9 @@ impl TestChannelMonitor {
 		}
 	}
 }
-impl channelmonitor::ManyChannelMonitor<EnforcingChannelKeys> for TestChannelMonitor {
+impl channelmonitor::ManyChannelMonitor for TestChannelMonitor {
+	type Keys = EnforcingChannelKeys;
+
 	fn add_monitor(&self, funding_txo: OutPoint, monitor: channelmonitor::ChannelMonitor<EnforcingChannelKeys>) -> Result<(), channelmonitor::ChannelMonitorUpdateErr> {
 		let mut ser = VecWriter(Vec::new());
 		monitor.write_for_disk(&mut ser).unwrap();
@@ -114,9 +116,9 @@ impl channelmonitor::ManyChannelMonitor<EnforcingChannelKeys> for TestChannelMon
 			hash_map::Entry::Occupied(entry) => entry,
 			hash_map::Entry::Vacant(_) => panic!("Didn't have monitor on update call"),
 		};
-		let mut deserialized_monitor = <(Sha256d, channelmonitor::ChannelMonitor<EnforcingChannelKeys>)>::
-			read(&mut Cursor::new(&map_entry.get().1), Arc::clone(&self.logger)).unwrap().1;
-		deserialized_monitor.update_monitor(update.clone()).unwrap();
+		let mut deserialized_monitor = <(BlockHash, channelmonitor::ChannelMonitor<EnforcingChannelKeys>)>::
+			read(&mut Cursor::new(&map_entry.get().1)).unwrap().1;
+		deserialized_monitor.update_monitor(update.clone(), &&TestBroadcaster {}, &self.logger).unwrap();
 		let mut ser = VecWriter(Vec::new());
 		deserialized_monitor.write_for_disk(&mut ser).unwrap();
 		map_entry.insert((update.update_id, ser.0));
@@ -144,7 +146,7 @@ impl KeysInterface for KeyProvider {
 	fn get_destination_script(&self) -> Script {
 		let secp_ctx = Secp256k1::signing_only();
 		let channel_monitor_claim_key = SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, self.node_id]).unwrap();
-		let our_channel_monitor_claim_key_hash = Hash160::hash(&PublicKey::from_secret_key(&secp_ctx, &channel_monitor_claim_key).serialize());
+		let our_channel_monitor_claim_key_hash = WPubkeyHash::hash(&PublicKey::from_secret_key(&secp_ctx, &channel_monitor_claim_key).serialize());
 		Builder::new().push_opcode(opcodes::all::OP_PUSHBYTES_0).push_slice(&our_channel_monitor_claim_key_hash[..]).into_script()
 	}
 
@@ -164,6 +166,7 @@ impl KeysInterface for KeyProvider {
 			SecretKey::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, self.node_id]).unwrap(),
 			[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, self.node_id],
 			channel_value_satoshis,
+			(0, 0),
 		))
 	}
 
@@ -180,14 +183,14 @@ impl KeysInterface for KeyProvider {
 }
 
 #[inline]
-pub fn do_test(data: &[u8]) {
+pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 	let fee_est = Arc::new(FuzzEstimator{});
 	let broadcast = Arc::new(TestBroadcaster{});
 
 	macro_rules! make_node {
 		($node_id: expr) => { {
-			let logger: Arc<dyn Logger> = Arc::new(test_logger::TestLogger::new($node_id.to_string()));
-			let watch = Arc::new(ChainWatchInterfaceUtil::new(Network::Bitcoin, Arc::clone(&logger)));
+			let logger: Arc<dyn Logger> = Arc::new(test_logger::TestLogger::new($node_id.to_string(), out.clone()));
+			let watch = Arc::new(ChainWatchInterfaceUtil::new(Network::Bitcoin));
 			let monitor = Arc::new(TestChannelMonitor::new(watch.clone(), broadcast.clone(), logger.clone(), fee_est.clone()));
 
 			let keys_manager = Arc::new(KeyProvider { node_id: $node_id, session_id: atomic::AtomicU8::new(0), channel_id: atomic::AtomicU8::new(0) });
@@ -195,15 +198,15 @@ pub fn do_test(data: &[u8]) {
 			config.channel_options.fee_proportional_millionths = 0;
 			config.channel_options.announced_channel = true;
 			config.peer_channel_config_limits.min_dust_limit_satoshis = 0;
-			(Arc::new(ChannelManager::new(Network::Bitcoin, fee_est.clone(), monitor.clone(), broadcast.clone(), Arc::clone(&logger), keys_manager.clone(), config, 0).unwrap()),
+			(Arc::new(ChannelManager::new(Network::Bitcoin, fee_est.clone(), monitor.clone(), broadcast.clone(), Arc::clone(&logger), keys_manager.clone(), config, 0)),
 			monitor)
 		} }
 	}
 
 	macro_rules! reload_node {
 		($ser: expr, $node_id: expr, $old_monitors: expr) => { {
-			let logger: Arc<dyn Logger> = Arc::new(test_logger::TestLogger::new($node_id.to_string()));
-			let watch = Arc::new(ChainWatchInterfaceUtil::new(Network::Bitcoin, Arc::clone(&logger)));
+			let logger: Arc<dyn Logger> = Arc::new(test_logger::TestLogger::new($node_id.to_string(), out.clone()));
+			let watch = Arc::new(ChainWatchInterfaceUtil::new(Network::Bitcoin));
 			let monitor = Arc::new(TestChannelMonitor::new(watch.clone(), broadcast.clone(), logger.clone(), fee_est.clone()));
 
 			let keys_manager = Arc::new(KeyProvider { node_id: $node_id, session_id: atomic::AtomicU8::new(0), channel_id: atomic::AtomicU8::new(0) });
@@ -215,7 +218,7 @@ pub fn do_test(data: &[u8]) {
 			let mut monitors = HashMap::new();
 			let mut old_monitors = $old_monitors.latest_monitors.lock().unwrap();
 			for (outpoint, (update_id, monitor_ser)) in old_monitors.drain() {
-				monitors.insert(outpoint, <(Sha256d, ChannelMonitor<EnforcingChannelKeys>)>::read(&mut Cursor::new(&monitor_ser), Arc::clone(&logger)).expect("Failed to read monitor").1);
+				monitors.insert(outpoint, <(BlockHash, ChannelMonitor<EnforcingChannelKeys>)>::read(&mut Cursor::new(&monitor_ser)).expect("Failed to read monitor").1);
 				monitor.latest_monitors.lock().unwrap().insert(outpoint, (update_id, monitor_ser));
 			}
 			let mut monitor_refs = HashMap::new();
@@ -233,7 +236,7 @@ pub fn do_test(data: &[u8]) {
 				channel_monitors: &mut monitor_refs,
 			};
 
-			(<(Sha256d, ChannelManager<EnforcingChannelKeys, Arc<TestChannelMonitor>, Arc<TestBroadcaster>, Arc<KeyProvider>, Arc<FuzzEstimator>>)>::read(&mut Cursor::new(&$ser.0), read_args).expect("Failed to read manager").1, monitor)
+			(<(BlockHash, ChannelManager<EnforcingChannelKeys, Arc<TestChannelMonitor>, Arc<TestBroadcaster>, Arc<KeyProvider>, Arc<FuzzEstimator>, Arc<dyn Logger>>)>::read(&mut Cursor::new(&$ser.0), read_args).expect("Failed to read manager").1, monitor)
 		} }
 	}
 
@@ -249,7 +252,7 @@ pub fn do_test(data: &[u8]) {
 				} else { panic!("Wrong event type"); }
 			};
 
-			$dest.handle_open_channel(&$source.get_our_node_id(), InitFeatures::supported(), &open_channel);
+			$dest.handle_open_channel(&$source.get_our_node_id(), InitFeatures::known(), &open_channel);
 			let accept_channel = {
 				let events = $dest.get_and_clear_pending_msg_events();
 				assert_eq!(events.len(), 1);
@@ -258,7 +261,7 @@ pub fn do_test(data: &[u8]) {
 				} else { panic!("Wrong event type"); }
 			};
 
-			$source.handle_accept_channel(&$dest.get_our_node_id(), InitFeatures::supported(), &accept_channel);
+			$source.handle_accept_channel(&$dest.get_our_node_id(), InitFeatures::known(), &accept_channel);
 			let funding_output;
 			{
 				let events = $source.get_and_clear_pending_events();
@@ -267,7 +270,7 @@ pub fn do_test(data: &[u8]) {
 					let tx = Transaction { version: $chan_id, lock_time: 0, input: Vec::new(), output: vec![TxOut {
 						value: *channel_value_satoshis, script_pubkey: output_script.clone(),
 					}]};
-					funding_output = OutPoint::new(tx.txid(), 0);
+					funding_output = OutPoint { txid: tx.txid(), index: 0 };
 					$source.funding_transaction_generated(&temporary_channel_id, funding_output);
 					channel_txn.push(tx);
 				} else { panic!("Wrong event type"); }
@@ -308,7 +311,7 @@ pub fn do_test(data: &[u8]) {
 			let mut posn = Vec::with_capacity(channel_txn.len());
 			for i in 0..channel_txn.len() {
 				txn.push(&channel_txn[i]);
-				posn.push(i as u32 + 1);
+				posn.push(i + 1);
 			}
 			$node.block_connected(&header, 1, &txn, &posn);
 			for i in 2..100 {
@@ -405,28 +408,56 @@ pub fn do_test(data: &[u8]) {
 
 	loop {
 		macro_rules! send_payment {
-			($source: expr, $dest: expr) => { {
+			($source: expr, $dest: expr, $amt: expr) => { {
 				let payment_hash = Sha256::hash(&[payment_id; 1]);
 				payment_id = payment_id.wrapping_add(1);
-				if let Err(_) = $source.send_payment(Route {
-					hops: vec![RouteHop {
+				if let Err(_) = $source.send_payment(&Route {
+					paths: vec![vec![RouteHop {
 						pubkey: $dest.0.get_our_node_id(),
 						node_features: NodeFeatures::empty(),
 						short_channel_id: $dest.1,
 						channel_features: ChannelFeatures::empty(),
-						fee_msat: 5000000,
+						fee_msat: $amt,
 						cltv_expiry_delta: 200,
-					}],
-				}, PaymentHash(payment_hash.into_inner())) {
+					}]],
+				}, PaymentHash(payment_hash.into_inner()), &None) {
 					// Probably ran out of funds
 					test_return!();
 				}
 			} };
+			($source: expr, $middle: expr, $dest: expr, $amt: expr) => { {
+				let payment_hash = Sha256::hash(&[payment_id; 1]);
+				payment_id = payment_id.wrapping_add(1);
+				if let Err(_) = $source.send_payment(&Route {
+					paths: vec![vec![RouteHop {
+						pubkey: $middle.0.get_our_node_id(),
+						node_features: NodeFeatures::empty(),
+						short_channel_id: $middle.1,
+						channel_features: ChannelFeatures::empty(),
+						fee_msat: 50000,
+						cltv_expiry_delta: 100,
+					},RouteHop {
+						pubkey: $dest.0.get_our_node_id(),
+						node_features: NodeFeatures::empty(),
+						short_channel_id: $dest.1,
+						channel_features: ChannelFeatures::empty(),
+						fee_msat: $amt,
+						cltv_expiry_delta: 200,
+					}]],
+				}, PaymentHash(payment_hash.into_inner()), &None) {
+					// Probably ran out of funds
+					test_return!();
+				}
+			} }
+		}
+		macro_rules! send_payment_with_secret {
 			($source: expr, $middle: expr, $dest: expr) => { {
 				let payment_hash = Sha256::hash(&[payment_id; 1]);
 				payment_id = payment_id.wrapping_add(1);
-				if let Err(_) = $source.send_payment(Route {
-					hops: vec![RouteHop {
+				let payment_secret = Sha256::hash(&[payment_id; 1]);
+				payment_id = payment_id.wrapping_add(1);
+				if let Err(_) = $source.send_payment(&Route {
+					paths: vec![vec![RouteHop {
 						pubkey: $middle.0.get_our_node_id(),
 						node_features: NodeFeatures::empty(),
 						short_channel_id: $middle.1,
@@ -440,8 +471,22 @@ pub fn do_test(data: &[u8]) {
 						channel_features: ChannelFeatures::empty(),
 						fee_msat: 5000000,
 						cltv_expiry_delta: 200,
-					}],
-				}, PaymentHash(payment_hash.into_inner())) {
+					}],vec![RouteHop {
+						pubkey: $middle.0.get_our_node_id(),
+						node_features: NodeFeatures::empty(),
+						short_channel_id: $middle.1,
+						channel_features: ChannelFeatures::empty(),
+						fee_msat: 50000,
+						cltv_expiry_delta: 100,
+					},RouteHop {
+						pubkey: $dest.0.get_our_node_id(),
+						node_features: NodeFeatures::empty(),
+						short_channel_id: $dest.1,
+						channel_features: ChannelFeatures::empty(),
+						fee_msat: 5000000,
+						cltv_expiry_delta: 200,
+					}]],
+				}, PaymentHash(payment_hash.into_inner()), &Some(PaymentSecret(payment_secret.into_inner()))) {
 					// Probably ran out of funds
 					test_return!();
 				}
@@ -599,12 +644,12 @@ pub fn do_test(data: &[u8]) {
 				});
 				for event in events.drain(..) {
 					match event {
-						events::Event::PaymentReceived { payment_hash, .. } => {
+						events::Event::PaymentReceived { payment_hash, payment_secret, amt } => {
 							if claim_set.insert(payment_hash.0) {
 								if $fail {
-									assert!(nodes[$node].fail_htlc_backwards(&payment_hash));
+									assert!(nodes[$node].fail_htlc_backwards(&payment_hash, &payment_secret));
 								} else {
-									assert!(nodes[$node].claim_funds(PaymentPreimage(payment_hash.0), 5_000_000));
+									assert!(nodes[$node].claim_funds(PaymentPreimage(payment_hash.0), &payment_secret, amt));
 								}
 							}
 						},
@@ -646,12 +691,12 @@ pub fn do_test(data: &[u8]) {
 					nodes[2].channel_monitor_updated(&chan_2_funding, *id);
 				}
 			},
-			0x09 => send_payment!(nodes[0], (&nodes[1], chan_a)),
-			0x0a => send_payment!(nodes[1], (&nodes[0], chan_a)),
-			0x0b => send_payment!(nodes[1], (&nodes[2], chan_b)),
-			0x0c => send_payment!(nodes[2], (&nodes[1], chan_b)),
-			0x0d => send_payment!(nodes[0], (&nodes[1], chan_a), (&nodes[2], chan_b)),
-			0x0e => send_payment!(nodes[2], (&nodes[1], chan_b), (&nodes[0], chan_a)),
+			0x09 => send_payment!(nodes[0], (&nodes[1], chan_a), 5_000_000),
+			0x0a => send_payment!(nodes[1], (&nodes[0], chan_a), 5_000_000),
+			0x0b => send_payment!(nodes[1], (&nodes[2], chan_b), 5_000_000),
+			0x0c => send_payment!(nodes[2], (&nodes[1], chan_b), 5_000_000),
+			0x0d => send_payment!(nodes[0], (&nodes[1], chan_a), (&nodes[2], chan_b), 5_000_000),
+			0x0e => send_payment!(nodes[2], (&nodes[1], chan_b), (&nodes[0], chan_a), 5_000_000),
 			0x0f => {
 				if !chan_a_disconnected {
 					nodes[0].peer_disconnected(&nodes[1].get_our_node_id(), false);
@@ -734,6 +779,26 @@ pub fn do_test(data: &[u8]) {
 				nodes[2] = node_c.clone();
 				monitor_c = new_monitor_c;
 			},
+			0x22 => send_payment_with_secret!(nodes[0], (&nodes[1], chan_a), (&nodes[2], chan_b)),
+			0x23 => send_payment_with_secret!(nodes[2], (&nodes[1], chan_b), (&nodes[0], chan_a)),
+			0x25 => send_payment!(nodes[0], (&nodes[1], chan_a), 10),
+			0x26 => send_payment!(nodes[1], (&nodes[0], chan_a), 10),
+			0x27 => send_payment!(nodes[1], (&nodes[2], chan_b), 10),
+			0x28 => send_payment!(nodes[2], (&nodes[1], chan_b), 10),
+			0x29 => send_payment!(nodes[0], (&nodes[1], chan_a), (&nodes[2], chan_b), 10),
+			0x2a => send_payment!(nodes[2], (&nodes[1], chan_b), (&nodes[0], chan_a), 10),
+			0x2b => send_payment!(nodes[0], (&nodes[1], chan_a), 1_000),
+			0x2c => send_payment!(nodes[1], (&nodes[0], chan_a), 1_000),
+			0x2d => send_payment!(nodes[1], (&nodes[2], chan_b), 1_000),
+			0x2e => send_payment!(nodes[2], (&nodes[1], chan_b), 1_000),
+			0x2f => send_payment!(nodes[0], (&nodes[1], chan_a), (&nodes[2], chan_b), 1_000),
+			0x30 => send_payment!(nodes[2], (&nodes[1], chan_b), (&nodes[0], chan_a), 1_000),
+			0x31 => send_payment!(nodes[0], (&nodes[1], chan_a), 100_000),
+			0x32 => send_payment!(nodes[1], (&nodes[0], chan_a), 100_000),
+			0x33 => send_payment!(nodes[1], (&nodes[2], chan_b), 100_000),
+			0x34 => send_payment!(nodes[2], (&nodes[1], chan_b), 100_000),
+			0x35 => send_payment!(nodes[0], (&nodes[1], chan_a), (&nodes[2], chan_b), 100_000),
+			0x36 => send_payment!(nodes[2], (&nodes[1], chan_b), (&nodes[0], chan_a), 100_000),
 			// 0x24 defined above
 			_ => test_return!(),
 		}
@@ -750,7 +815,11 @@ pub fn do_test(data: &[u8]) {
 	}
 }
 
+pub fn chanmon_consistency_test<Out: test_logger::Output>(data: &[u8], out: Out) {
+	do_test(data, out);
+}
+
 #[no_mangle]
 pub extern "C" fn chanmon_consistency_run(data: *const u8, datalen: usize) {
-	do_test(unsafe { std::slice::from_raw_parts(data, datalen) });
+	do_test(unsafe { std::slice::from_raw_parts(data, datalen) }, test_logger::DevNull{});
 }

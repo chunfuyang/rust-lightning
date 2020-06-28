@@ -9,10 +9,8 @@ use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::blockdata::script::Script;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::util::hash::BitcoinHash;
-use bitcoin_hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::network::constants::Network;
-
-use util::logger::Logger;
+use bitcoin::hash_types::{Txid, BlockHash};
 
 use std::sync::{Mutex, MutexGuard, Arc};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,6 +20,7 @@ use std::marker::PhantomData;
 use std::ptr;
 
 /// Used to give chain error details upstream
+#[derive(Clone)]
 pub enum ChainError {
 	/// Client doesn't support UTXO lookup (but the chain hash matches our genesis block hash)
 	NotSupported,
@@ -39,11 +38,11 @@ pub enum ChainError {
 /// events).
 pub trait ChainWatchInterface: Sync + Send {
 	/// Provides a txid/random-scriptPubKey-in-the-tx which much be watched for.
-	fn install_watch_tx(&self, txid: &Sha256dHash, script_pub_key: &Script);
+	fn install_watch_tx(&self, txid: &Txid, script_pub_key: &Script);
 
 	/// Provides an outpoint which must be watched for, providing any transactions which spend the
 	/// given outpoint.
-	fn install_watch_outpoint(&self, outpoint: (Sha256dHash, u32), out_script: &Script);
+	fn install_watch_outpoint(&self, outpoint: (Txid, u32), out_script: &Script);
 
 	/// Indicates that a listener needs to see all transactions.
 	fn watch_all_txn(&self);
@@ -52,11 +51,11 @@ pub trait ChainWatchInterface: Sync + Send {
 	/// short_channel_id (aka unspent_tx_output_identier). For BTC/tBTC channels the top three
 	/// bytes are the block height, the next 3 the transaction index within the block, and the
 	/// final two the output within the transaction.
-	fn get_chain_utxo(&self, genesis_hash: Sha256dHash, unspent_tx_output_identifier: u64) -> Result<(Script, u64), ChainError>;
+	fn get_chain_utxo(&self, genesis_hash: BlockHash, unspent_tx_output_identifier: u64) -> Result<(Script, u64), ChainError>;
 
-	/// Gets the list of transactions and transaction indices that the ChainWatchInterface is
+	/// Gets the list of transaction indices within a given block that the ChainWatchInterface is
 	/// watching for.
-	fn filter_block<'a>(&self, block: &'a Block) -> (Vec<&'a Transaction>, Vec<u32>);
+	fn filter_block(&self, block: &Block) -> Vec<usize>;
 
 	/// Returns a usize that changes when the ChainWatchInterface's watched data is modified.
 	/// Users of `filter_block` should pre-save a copy of `reentered`'s return value and use it to
@@ -87,7 +86,7 @@ pub trait ChainListener: Sync + Send {
 	///
 	/// This also means those counting confirmations using block_connected callbacks should watch
 	/// for duplicate headers and not count them towards confirmations!
-	fn block_connected(&self, header: &BlockHeader, height: u32, txn_matched: &[&Transaction], indexes_of_txn_matched: &[u32]);
+	fn block_connected(&self, header: &BlockHeader, height: u32, txn_matched: &[&Transaction], indexes_of_txn_matched: &[usize]);
 	/// Notifies a listener that a block was disconnected.
 	/// Unlike block_connected, this *must* never be called twice for the same disconnect event.
 	/// Height must be the one of the block which was disconnected (not new height of the best chain)
@@ -120,7 +119,7 @@ pub trait FeeEstimator: Sync + Send {
 	/// This translates to:
 	///  * satoshis-per-byte * 250
 	///  * ceil(satoshis-per-kbyte / 4)
-	fn get_est_sat_per_1000_weight(&self, confirmation_target: ConfirmationTarget) -> u64;
+	fn get_est_sat_per_1000_weight(&self, confirmation_target: ConfirmationTarget) -> u32;
 }
 
 /// Minimum relay fee as required by bitcoin network mempool policy.
@@ -134,11 +133,11 @@ pub struct ChainWatchedUtil {
 	// We are more conservative in matching during testing to ensure everything matches *exactly*,
 	// even though during normal runtime we take more optimized match approaches...
 	#[cfg(test)]
-	watched_txn: HashSet<(Sha256dHash, Script)>,
+	watched_txn: HashSet<(Txid, Script)>,
 	#[cfg(not(test))]
 	watched_txn: HashSet<Script>,
 
-	watched_outpoints: HashSet<(Sha256dHash, u32)>,
+	watched_outpoints: HashSet<(Txid, u32)>,
 }
 
 impl ChainWatchedUtil {
@@ -153,7 +152,7 @@ impl ChainWatchedUtil {
 
 	/// Registers a tx for monitoring, returning true if it was a new tx and false if we'd already
 	/// been watching for it.
-	pub fn register_tx(&mut self, txid: &Sha256dHash, script_pub_key: &Script) -> bool {
+	pub fn register_tx(&mut self, txid: &Txid, script_pub_key: &Script) -> bool {
 		if self.watch_all { return false; }
 		#[cfg(test)]
 		{
@@ -168,7 +167,7 @@ impl ChainWatchedUtil {
 
 	/// Registers an outpoint for monitoring, returning true if it was a new outpoint and false if
 	/// we'd already been watching for it
-	pub fn register_outpoint(&mut self, outpoint: (Sha256dHash, u32), _script_pub_key: &Script) -> bool {
+	pub fn register_outpoint(&mut self, outpoint: (Txid, u32), _script_pub_key: &Script) -> bool {
 		if self.watch_all { return false; }
 		self.watched_outpoints.insert(outpoint)
 	}
@@ -219,7 +218,7 @@ impl ChainWatchedUtil {
 /// parameters with static lifetimes). Other times you can afford a reference, which is more
 /// efficient, in which case BlockNotifierRef is a more appropriate type. Defining these type
 /// aliases prevents issues such as overly long function definitions.
-pub type BlockNotifierArc = Arc<BlockNotifier<'static, Arc<ChainListener>>>;
+pub type BlockNotifierArc<C> = Arc<BlockNotifier<'static, Arc<ChainListener>, C>>;
 
 /// BlockNotifierRef is useful when you want a BlockNotifier that points to ChainListeners
 /// with nonstatic lifetimes. This is useful for when static lifetimes are not needed. Nonstatic
@@ -228,7 +227,7 @@ pub type BlockNotifierArc = Arc<BlockNotifier<'static, Arc<ChainListener>>>;
 /// requires parameters with static lifetimes), in which case BlockNotifierArc is a more
 /// appropriate type. Defining these type aliases for common usages prevents issues such as
 /// overly long function definitions.
-pub type BlockNotifierRef<'a> = BlockNotifier<'a, &'a ChainListener>;
+pub type BlockNotifierRef<'a, C> = BlockNotifier<'a, &'a ChainListener, C>;
 
 /// Utility for notifying listeners about new blocks, and handling block rescans if new watch
 /// data is registered.
@@ -237,15 +236,15 @@ pub type BlockNotifierRef<'a> = BlockNotifier<'a, &'a ChainListener>;
 /// or a BlockNotifierRef for conciseness. See their documentation for more details, but essentially
 /// you should default to using a BlockNotifierRef, and use a BlockNotifierArc instead when you
 /// require ChainListeners with static lifetimes, such as when you're using lightning-net-tokio.
-pub struct BlockNotifier<'a, CL: Deref<Target = ChainListener + 'a> + 'a> {
+pub struct BlockNotifier<'a, CL: Deref<Target = ChainListener + 'a> + 'a, C: Deref> where C::Target: ChainWatchInterface {
 	listeners: Mutex<Vec<CL>>,
-	chain_monitor: Arc<ChainWatchInterface>,
+	chain_monitor: C,
 	phantom: PhantomData<&'a ()>,
 }
 
-impl<'a, CL: Deref<Target = ChainListener + 'a> + 'a> BlockNotifier<'a, CL> {
+impl<'a, CL: Deref<Target = ChainListener + 'a> + 'a, C: Deref> BlockNotifier<'a, CL, C> where C::Target: ChainWatchInterface {
 	/// Constructs a new BlockNotifier without any listeners.
-	pub fn new(chain_monitor: Arc<ChainWatchInterface>) -> BlockNotifier<'a, CL> {
+	pub fn new(chain_monitor: C) -> BlockNotifier<'a, CL, C> {
 		BlockNotifier {
 			listeners: Mutex::new(Vec::new()),
 			chain_monitor,
@@ -275,11 +274,15 @@ impl<'a, CL: Deref<Target = ChainListener + 'a> + 'a> BlockNotifier<'a, CL> {
 	///
 	/// Handles re-scanning the block and calling block_connected again if listeners register new
 	/// watch data during the callbacks for you (see ChainListener::block_connected for more info).
-	pub fn block_connected<'b>(&self, block: &'b Block, height: u32) {
+	pub fn block_connected(&self, block: &Block, height: u32) {
 		let mut reentered = true;
 		while reentered {
-			let (matched, matched_index) = self.chain_monitor.filter_block(block);
-			reentered = self.block_connected_checked(&block.header, height, matched.as_slice(), matched_index.as_slice());
+			let matched_indexes = self.chain_monitor.filter_block(block);
+			let mut matched_txn = Vec::new();
+			for index in matched_indexes.iter() {
+				matched_txn.push(&block.txdata[*index]);
+			}
+			reentered = self.block_connected_checked(&block.header, height, matched_txn.as_slice(), matched_indexes.as_slice());
 		}
 	}
 
@@ -289,7 +292,7 @@ impl<'a, CL: Deref<Target = ChainListener + 'a> + 'a> BlockNotifier<'a, CL> {
 	/// Returns true if notified listeners registered additional watch data (implying that the
 	/// block must be re-scanned and this function called again prior to further block_connected
 	/// calls, see ChainListener::block_connected for more info).
-	pub fn block_connected_checked(&self, header: &BlockHeader, height: u32, txn_matched: &[&Transaction], indexes_of_txn_matched: &[u32]) -> bool {
+	pub fn block_connected_checked(&self, header: &BlockHeader, height: u32, txn_matched: &[&Transaction], indexes_of_txn_matched: &[usize]) -> bool {
 		let last_seen = self.chain_monitor.reentered();
 
 		let listeners = self.listeners.lock().unwrap();
@@ -315,7 +318,6 @@ pub struct ChainWatchInterfaceUtil {
 	network: Network,
 	watched: Mutex<ChainWatchedUtil>,
 	reentered: AtomicUsize,
-	logger: Arc<Logger>,
 }
 
 // We only expose PartialEq in test since its somewhat unclear exactly what it should do and we're
@@ -331,14 +333,14 @@ impl PartialEq for ChainWatchInterfaceUtil {
 
 /// Register listener
 impl ChainWatchInterface for ChainWatchInterfaceUtil {
-	fn install_watch_tx(&self, txid: &Sha256dHash, script_pub_key: &Script) {
+	fn install_watch_tx(&self, txid: &Txid, script_pub_key: &Script) {
 		let mut watched = self.watched.lock().unwrap();
 		if watched.register_tx(txid, script_pub_key) {
 			self.reentered.fetch_add(1, Ordering::Relaxed);
 		}
 	}
 
-	fn install_watch_outpoint(&self, outpoint: (Sha256dHash, u32), out_script: &Script) {
+	fn install_watch_outpoint(&self, outpoint: (Txid, u32), out_script: &Script) {
 		let mut watched = self.watched.lock().unwrap();
 		if watched.register_outpoint(outpoint, out_script) {
 			self.reentered.fetch_add(1, Ordering::Relaxed);
@@ -352,26 +354,24 @@ impl ChainWatchInterface for ChainWatchInterfaceUtil {
 		}
 	}
 
-	fn get_chain_utxo(&self, genesis_hash: Sha256dHash, _unspent_tx_output_identifier: u64) -> Result<(Script, u64), ChainError> {
+	fn get_chain_utxo(&self, genesis_hash: BlockHash, _unspent_tx_output_identifier: u64) -> Result<(Script, u64), ChainError> {
 		if genesis_hash != genesis_block(self.network).header.bitcoin_hash() {
 			return Err(ChainError::NotWatched);
 		}
 		Err(ChainError::NotSupported)
 	}
 
-	fn filter_block<'a>(&self, block: &'a Block) -> (Vec<&'a Transaction>, Vec<u32>) {
-		let mut matched = Vec::new();
+	fn filter_block(&self, block: &Block) -> Vec<usize> {
 		let mut matched_index = Vec::new();
 		{
 			let watched = self.watched.lock().unwrap();
 			for (index, transaction) in block.txdata.iter().enumerate() {
 				if self.does_match_tx_unguarded(transaction, &watched) {
-					matched.push(transaction);
-					matched_index.push(index as u32);
+					matched_index.push(index);
 				}
 			}
 		}
-		(matched, matched_index)
+		matched_index
 	}
 
 	fn reentered(&self) -> usize {
@@ -381,12 +381,11 @@ impl ChainWatchInterface for ChainWatchInterfaceUtil {
 
 impl ChainWatchInterfaceUtil {
 	/// Creates a new ChainWatchInterfaceUtil for the given network
-	pub fn new(network: Network, logger: Arc<Logger>) -> ChainWatchInterfaceUtil {
+	pub fn new(network: Network) -> ChainWatchInterfaceUtil {
 		ChainWatchInterfaceUtil {
-			network: network,
+			network,
 			watched: Mutex::new(ChainWatchedUtil::new()),
 			reentered: AtomicUsize::new(1),
-			logger: logger,
 		}
 	}
 
@@ -411,7 +410,7 @@ mod tests {
 	fn register_listener_test() {
 		let chanmon_cfgs = create_chanmon_cfgs(1);
 		let node_cfgs = create_node_cfgs(1, &chanmon_cfgs);
-		let block_notifier = BlockNotifier::new(node_cfgs[0].chain_monitor.clone());
+		let block_notifier = BlockNotifier::new(node_cfgs[0].chain_monitor);
 		assert_eq!(block_notifier.listeners.lock().unwrap().len(), 0);
 		let listener = &node_cfgs[0].chan_monitor.simple_monitor as &ChainListener;
 		block_notifier.register_listener(listener);
@@ -425,7 +424,7 @@ mod tests {
 	fn unregister_single_listener_test() {
 		let chanmon_cfgs = create_chanmon_cfgs(2);
 		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
-		let block_notifier = BlockNotifier::new(node_cfgs[0].chain_monitor.clone());
+		let block_notifier = BlockNotifier::new(node_cfgs[0].chain_monitor);
 		let listener1 = &node_cfgs[0].chan_monitor.simple_monitor as &ChainListener;
 		let listener2 = &node_cfgs[1].chan_monitor.simple_monitor as &ChainListener;
 		block_notifier.register_listener(listener1);
@@ -444,7 +443,7 @@ mod tests {
 	fn unregister_single_listener_ref_test() {
 		let chanmon_cfgs = create_chanmon_cfgs(2);
 		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
-		let block_notifier = BlockNotifier::new(node_cfgs[0].chain_monitor.clone());
+		let block_notifier = BlockNotifier::new(node_cfgs[0].chain_monitor);
 		block_notifier.register_listener(&node_cfgs[0].chan_monitor.simple_monitor as &ChainListener);
 		block_notifier.register_listener(&node_cfgs[1].chan_monitor.simple_monitor as &ChainListener);
 		let vec = block_notifier.listeners.lock().unwrap();
@@ -461,7 +460,7 @@ mod tests {
 	fn unregister_multiple_of_the_same_listeners_test() {
 		let chanmon_cfgs = create_chanmon_cfgs(2);
 		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
-		let block_notifier = BlockNotifier::new(node_cfgs[0].chain_monitor.clone());
+		let block_notifier = BlockNotifier::new(node_cfgs[0].chain_monitor);
 		let listener1 = &node_cfgs[0].chan_monitor.simple_monitor as &ChainListener;
 		let listener2 = &node_cfgs[1].chan_monitor.simple_monitor as &ChainListener;
 		block_notifier.register_listener(listener1);

@@ -1,18 +1,18 @@
-use bitcoin_hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::blockdata::script::{Script, Builder};
 use bitcoin::blockdata::block::Block;
-use bitcoin::blockdata::transaction::Transaction;
+use bitcoin::hash_types::{Txid, BlockHash};
 
 use lightning::chain::chaininterface::{ChainError,ChainWatchInterface};
 use lightning::ln::channelmanager::ChannelDetails;
 use lightning::ln::features::InitFeatures;
 use lightning::ln::msgs;
 use lightning::ln::msgs::RoutingMessageHandler;
-use lightning::ln::router::{Router, RouteHint};
+use lightning::routing::router::{get_route, RouteHint};
 use lightning::util::logger::Logger;
 use lightning::util::ser::Readable;
+use lightning::routing::network_graph::{NetGraphMsgHandler, RoutingFees};
 
-use secp256k1::key::PublicKey;
+use bitcoin::secp256k1::key::PublicKey;
 
 use utils::test_logger;
 
@@ -72,15 +72,15 @@ struct DummyChainWatcher {
 }
 
 impl ChainWatchInterface for DummyChainWatcher {
-	fn install_watch_tx(&self, _txid: &Sha256dHash, _script_pub_key: &Script) { }
-	fn install_watch_outpoint(&self, _outpoint: (Sha256dHash, u32), _out_script: &Script) { }
+	fn install_watch_tx(&self, _txid: &Txid, _script_pub_key: &Script) { }
+	fn install_watch_outpoint(&self, _outpoint: (Txid, u32), _out_script: &Script) { }
 	fn watch_all_txn(&self) { }
-	fn filter_block<'a>(&self, _block: &'a Block) -> (Vec<&'a Transaction>, Vec<u32>) {
-		(Vec::new(), Vec::new())
+	fn filter_block(&self, _block: &Block) -> Vec<usize> {
+		Vec::new()
 	}
 	fn reentered(&self) -> usize { 0 }
 
-	fn get_chain_utxo(&self, _genesis_hash: Sha256dHash, _unspent_tx_output_identifier: u64) -> Result<(Script, u64), ChainError> {
+	fn get_chain_utxo(&self, _genesis_hash: BlockHash, _unspent_tx_output_identifier: u64) -> Result<(Script, u64), ChainError> {
 		match self.input.get_slice(2) {
 			Some(&[0, _]) => Err(ChainError::NotSupported),
 			Some(&[1, _]) => Err(ChainError::NotWatched),
@@ -93,7 +93,7 @@ impl ChainWatchInterface for DummyChainWatcher {
 }
 
 #[inline]
-pub fn do_test(data: &[u8]) {
+pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 	let input = Arc::new(InputData {
 		data: data.to_vec(),
 		read_pos: AtomicUsize::new(0),
@@ -124,7 +124,6 @@ pub fn do_test(data: &[u8]) {
 					msgs::DecodeError::UnknownVersion => return,
 					msgs::DecodeError::UnknownRequiredFeature => return,
 					msgs::DecodeError::InvalidValue => return,
-					msgs::DecodeError::ExtraAddressesPerType => return,
 					msgs::DecodeError::BadLengthDescriptor => return,
 					msgs::DecodeError::ShortRead => panic!("We picked the length..."),
 					msgs::DecodeError::Io(e) => panic!(format!("{}", e)),
@@ -151,13 +150,13 @@ pub fn do_test(data: &[u8]) {
 		}
 	}
 
-	let logger: Arc<dyn Logger> = Arc::new(test_logger::TestLogger::new("".to_owned()));
+	let logger: Arc<dyn Logger> = Arc::new(test_logger::TestLogger::new("".to_owned(), out));
 	let chain_monitor = Arc::new(DummyChainWatcher {
 		input: Arc::clone(&input),
 	});
 
 	let our_pubkey = get_pubkey!();
-	let router = Router::new(our_pubkey.clone(), chain_monitor, Arc::clone(&logger));
+	let net_graph_msg_handler = NetGraphMsgHandler::new(chain_monitor, Arc::clone(&logger));
 
 	loop {
 		match get_slice!(1)[0] {
@@ -167,22 +166,22 @@ pub fn do_test(data: &[u8]) {
 				if addr_len > (37+1)*4 {
 					return;
 				}
-				let _ = router.handle_node_announcement(&decode_msg_with_len16!(msgs::NodeAnnouncement, 64, 288));
+				let _ = net_graph_msg_handler.handle_node_announcement(&decode_msg_with_len16!(msgs::NodeAnnouncement, 64, 288));
 			},
 			1 => {
-				let _ = router.handle_channel_announcement(&decode_msg_with_len16!(msgs::ChannelAnnouncement, 64*4, 32+8+33*4));
+				let _ = net_graph_msg_handler.handle_channel_announcement(&decode_msg_with_len16!(msgs::ChannelAnnouncement, 64*4, 32+8+33*4));
 			},
 			2 => {
-				let _ = router.handle_channel_update(&decode_msg!(msgs::ChannelUpdate, 128));
+				let _ = net_graph_msg_handler.handle_channel_update(&decode_msg!(msgs::ChannelUpdate, 128));
 			},
 			3 => {
 				match get_slice!(1)[0] {
 					0 => {
-						router.handle_htlc_fail_channel_update(&msgs::HTLCFailChannelUpdate::ChannelUpdateMessage {msg: decode_msg!(msgs::ChannelUpdate, 128)});
+						net_graph_msg_handler.handle_htlc_fail_channel_update(&msgs::HTLCFailChannelUpdate::ChannelUpdateMessage {msg: decode_msg!(msgs::ChannelUpdate, 128)});
 					},
 					1 => {
 						let short_channel_id = slice_to_be64(get_slice!(8));
-						router.handle_htlc_fail_channel_update(&msgs::HTLCFailChannelUpdate::ChannelClosed {short_channel_id, is_permanent: false});
+						net_graph_msg_handler.handle_htlc_fail_channel_update(&msgs::HTLCFailChannelUpdate::ChannelClosed {short_channel_id, is_permanent: false});
 					},
 					_ => return,
 				}
@@ -218,22 +217,28 @@ pub fn do_test(data: &[u8]) {
 						last_hops_vec.push(RouteHint {
 							src_node_id: get_pubkey!(),
 							short_channel_id: slice_to_be64(get_slice!(8)),
-							fee_base_msat: slice_to_be32(get_slice!(4)),
-							fee_proportional_millionths: slice_to_be32(get_slice!(4)),
+							fees: RoutingFees {
+								base_msat: slice_to_be32(get_slice!(4)),
+								proportional_millionths: slice_to_be32(get_slice!(4)),
+							},
 							cltv_expiry_delta: slice_to_be16(get_slice!(2)),
 							htlc_minimum_msat: slice_to_be64(get_slice!(8)),
 						});
 					}
 					&last_hops_vec[..]
 				};
-				let _ = router.get_route(&target, first_hops, last_hops, slice_to_be64(get_slice!(8)), slice_to_be32(get_slice!(4)));
+				let _ = get_route(&our_pubkey, &net_graph_msg_handler.network_graph.read().unwrap(), &target, first_hops, last_hops, slice_to_be64(get_slice!(8)), slice_to_be32(get_slice!(4)), Arc::clone(&logger));
 			},
 			_ => return,
 		}
 	}
 }
 
+pub fn router_test<Out: test_logger::Output>(data: &[u8], out: Out) {
+	do_test(data, out);
+}
+
 #[no_mangle]
 pub extern "C" fn router_run(data: *const u8, datalen: usize) {
-	do_test(unsafe { std::slice::from_raw_parts(data, datalen) });
+	do_test(unsafe { std::slice::from_raw_parts(data, datalen) }, test_logger::DevNull {});
 }
